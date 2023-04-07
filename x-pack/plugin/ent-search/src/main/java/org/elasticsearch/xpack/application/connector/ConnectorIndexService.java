@@ -20,13 +20,15 @@ import org.elasticsearch.action.admin.indices.get.GetIndexResponse;
 import org.elasticsearch.action.ingest.GetPipelineRequest;
 import org.elasticsearch.action.ingest.GetPipelineResponse;
 import org.elasticsearch.action.ingest.PutPipelineRequest;
+import org.elasticsearch.action.support.master.AcknowledgedResponse;
 import org.elasticsearch.client.internal.Client;
 import org.elasticsearch.client.internal.OriginSettingClient;
 import org.elasticsearch.cluster.ClusterChangedEvent;
 import org.elasticsearch.cluster.ClusterStateListener;
 import org.elasticsearch.cluster.metadata.IndexMetadata;
 import org.elasticsearch.cluster.service.ClusterService;
-import org.elasticsearch.common.bytes.BytesArray;
+import org.elasticsearch.common.bytes.BytesReference;
+import org.elasticsearch.common.io.Streams;
 import org.elasticsearch.common.io.stream.NamedWriteableRegistry;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.concurrent.ThreadContext;
@@ -37,6 +39,7 @@ import org.elasticsearch.xcontent.XContentBuilder;
 import org.elasticsearch.xcontent.XContentType;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.UncheckedIOException;
 
 import static org.elasticsearch.xcontent.XContentFactory.jsonBuilder;
@@ -44,7 +47,7 @@ import static org.elasticsearch.xpack.core.ClientHelper.ENT_SEARCH_ORIGIN;
 import static org.elasticsearch.xpack.core.ClientHelper.executeAsyncWithOrigin;
 
 /**
-  * A service that manages the persistent {@link Connector} configurations.
+  * A service that manages the persistent Connector configurations.
   *
   */
 public class ConnectorIndexService implements ClusterStateListener {
@@ -54,6 +57,9 @@ public class ConnectorIndexService implements ClusterStateListener {
     public static final String CONNECTOR_SYNC_JOB_ALIAS_NAME = ".elastic-connectors-sync-jobs";
     public static final String CONNECTOR_SYNC_JOB_CONCRETE_INDEX_NAME = ".elastic-connectors-sync-jobs-v1";
     public static final String ENT_SEARCH_INGESTION_PIPELINE_NAME = "ent-search-generic-ingestion";
+
+    public static final String ROOT_RESOURCE_PATH = "/";
+    public static final String ENT_SEARCH_INGESTION_PIPELINE_PATH = ROOT_RESOURCE_PATH + "generic_ingestion_pipeline.json";
 
     private final Client clientWithOrigin;
     private final ClusterService clusterService;
@@ -88,7 +94,6 @@ public class ConnectorIndexService implements ClusterStateListener {
         );
 
         ensurePipeline(clientWithOrigin);
-
         this.clusterService.removeListener(this);
     }
 
@@ -116,10 +121,27 @@ public class ConnectorIndexService implements ClusterStateListener {
     }
 
     private static void createPipeline(Client client) {
-        BytesArray bytes = new BytesArray(EntSearchPipeline.getPipelineDefinition().getBytes());
+        InputStream inputStream = ConnectorIndexService.class.getResourceAsStream(ENT_SEARCH_INGESTION_PIPELINE_PATH);
+        BytesReference bytes;
+        try {
+            bytes = Streams.readFully(inputStream);
+        } catch (IOException e) {
+            logger.fatal("Error reading pipeline definition for " + ENT_SEARCH_INGESTION_PIPELINE_NAME + " " + e );
+            throw new UncheckedIOException(e);
+        }
         PutPipelineRequest putPipelineRequest = new PutPipelineRequest(ENT_SEARCH_INGESTION_PIPELINE_NAME, bytes, XContentType.JSON);
         client.admin().cluster().putPipeline(putPipelineRequest);
-        logger.info("Created pipeline" + ENT_SEARCH_INGESTION_PIPELINE_NAME);
+        ThreadContext threadContext = client.threadPool().getThreadContext();
+        executeAsyncWithOrigin(threadContext, ENT_SEARCH_ORIGIN, putPipelineRequest, new ActionListener<AcknowledgedResponse>() {
+            public void onResponse(AcknowledgedResponse response) {
+                if (response.isAcknowledged() == false) {
+                    logger.error("Could not create pipeline " + ENT_SEARCH_INGESTION_PIPELINE_NAME);
+                }
+            }
+            public void onFailure(Exception e) {
+                logger.error("Error creating pipeline " + ENT_SEARCH_INGESTION_PIPELINE_NAME + " " + e.toString());
+            }
+        }, client.admin().cluster()::putPipeline);
     }
 
     private static void ensureInternalIndex(Client client, String index, XContentBuilder mappings, Settings settings, String alias) {
@@ -127,13 +149,11 @@ public class ConnectorIndexService implements ClusterStateListener {
         ThreadContext threadContext = client.threadPool().getThreadContext();
         executeAsyncWithOrigin(threadContext, ENT_SEARCH_ORIGIN, getIndexRequest, new ActionListener<GetIndexResponse>() {
             public void onResponse(GetIndexResponse getIndexResponse) {
-                logger.info("Found " + index + " index.");
             }
 
             public void onFailure(Exception e) {
                 final Throwable cause = ExceptionsHelper.unwrapCause(e);
                 if (cause instanceof ResourceNotFoundException) {
-                    logger.error("Index " + index + " not found.");
                     createInternalIndex(client, index, mappings, settings, alias);
                 } else {
                     logger.error("Error getting " + index + " index " + e.toString());
@@ -149,15 +169,12 @@ public class ConnectorIndexService implements ClusterStateListener {
             public void onResponse(GetPipelineResponse getPipelineResponse) {
                 if (getPipelineResponse.isFound() == false) {
                     createPipeline(client);
-                } else {
-                    logger.info("Found " + ENT_SEARCH_INGESTION_PIPELINE_NAME + " pipeline.");
                 }
             }
 
             public void onFailure(Exception e) {
                 final Throwable cause = ExceptionsHelper.unwrapCause(e);
                 if (cause instanceof ResourceNotFoundException) {
-                    logger.error("Pipeline " + ENT_SEARCH_INGESTION_PIPELINE_NAME + " not found.");
                     createPipeline(client);
                 } else {
                     logger.error("Error getting " + ENT_SEARCH_INGESTION_PIPELINE_NAME + " index " + e.toString());
@@ -168,11 +185,8 @@ public class ConnectorIndexService implements ClusterStateListener {
 
     private static Settings getConnectorsIndexSettings() {
         return Settings.builder()
-            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
-            .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
-            .put(IndexMetadata.SETTING_AUTO_EXPAND_REPLICAS, "0-3")
+            .put(IndexMetadata.SETTING_AUTO_EXPAND_REPLICAS, "0-1")
             .put(IndexMetadata.SETTING_INDEX_HIDDEN, true)
-            .put("index.refresh_interval", "1s")
             .build();
     }
 
@@ -182,61 +196,116 @@ public class ConnectorIndexService implements ClusterStateListener {
             builder.startObject();
             {
                 builder.startObject("_meta");
-                builder.field("version", Version.CURRENT.toString());
+                {
+                    builder.field("version", Version.CURRENT.toString());
+                    builder.startObject("pipeline");
+                        {
+                            builder.field("default_extract_binary_content", true);
+                            builder.field("default_name", ENT_SEARCH_INGESTION_PIPELINE_NAME);
+                            builder.field("default_reduce_whitespace", true);
+                            builder.field("default_run_ml_inference", true);
+                        }
+                    builder.endObject();
+                }
                 builder.endObject();
 
                 builder.field("dynamic", "false");
                 builder.startObject("properties");
                 {
-                    builder.startObject(Connector.ERROR_FIELD.getPreferredName());
+                    builder.startObject(ConnectorIndexFields.API_KEY_ID_FIELD.getPreferredName());
                     builder.field("type", "keyword");
                     builder.endObject();
 
-                    builder.startObject(Connector.INDEX_NAME_FIELD.getPreferredName());
+                    builder.startObject(ConnectorIndexFields.CONFIGURATION_FIELD.getPreferredName());
+                    builder.field("type", "object");
+                    builder.field("enabled", false);
+                    builder.endObject();
+
+                    builder.startObject(ConnectorIndexFields.CUSTOM_SCHEDULING_FIELD.getPreferredName());
+                    builder.field("type", "object");
+                    builder.field("enabled", false);
+                    builder.endObject();
+
+                    builder.startObject(ConnectorIndexFields.DESCRIPTION_FIELD.getPreferredName());
                     builder.field("type", "keyword");
                     builder.endObject();
 
-                    builder.startObject(Connector.IS_NATIVE_FIELD.getPreferredName());
+                    builder.startObject(ConnectorIndexFields.ERROR_FIELD.getPreferredName());
+                    builder.field("type", "keyword");
+                    builder.endObject();
+
+                    builder.startObject(ConnectorIndexFields.FEATURES_FIELD.getPreferredName());
+                    builder.field("type", "object");
+                    builder.endObject();
+
+                    builder.startObject(ConnectorIndexFields.FILTERING_FIELD.getPreferredName());
+                    builder.field("type", "object");
+                    builder.field("enabled", false);
+                    builder.endObject();
+
+                    builder.startObject(ConnectorIndexFields.INDEX_NAME_FIELD.getPreferredName());
+                    builder.field("type", "keyword");
+                    builder.endObject();
+
+                    builder.startObject(ConnectorIndexFields.IS_NATIVE_FIELD.getPreferredName());
                     builder.field("type", "boolean");
                     builder.endObject();
 
-                    builder.startObject(Connector.LANGUAGE_FIELD.getPreferredName());
+                    builder.startObject(ConnectorIndexFields.LANGUAGE_FIELD.getPreferredName());
                     builder.field("type", "keyword");
                     builder.endObject();
 
-                    builder.startObject(Connector.LAST_SEEN_FIELD.getPreferredName());
+                    builder.startObject(ConnectorIndexFields.LAST_DELETED_DOCUMENT_COUNT_FIELD.getPreferredName());
+                    builder.field("type", "long");
+                    builder.endObject();
+
+                    builder.startObject(ConnectorIndexFields.LAST_INDEXED_DOCUMENT_COUNT_FIELD.getPreferredName());
+                    builder.field("type", "long");
+                    builder.endObject();
+
+                    builder.startObject(ConnectorIndexFields.LAST_SEEN_FIELD.getPreferredName());
                     builder.field("type", "date");
                     builder.endObject();
 
-                    builder.startObject(Connector.LAST_SYNC_ERROR_FIELD.getPreferredName());
-                    builder.field("type", "text");
-                    builder.endObject();
-
-                    builder.startObject(Connector.LAST_SYNC_STATUS_FIELD.getPreferredName());
+                    builder.startObject(ConnectorIndexFields.LAST_SYNC_ERROR_FIELD.getPreferredName());
                     builder.field("type", "keyword");
                     builder.endObject();
 
-                    builder.startObject(Connector.LAST_SYNC_SCHEDULED_AT_FIELD.getPreferredName());
+                    builder.startObject(ConnectorIndexFields.LAST_SYNC_SCHEDULED_AT_FIELD.getPreferredName());
                     builder.field("type", "date");
                     builder.endObject();
 
-                    builder.startObject(Connector.LAST_SYNCED_FIELD.getPreferredName());
+                    builder.startObject(ConnectorIndexFields.LAST_SYNC_STATUS_FIELD.getPreferredName());
+                    builder.field("type", "keyword");
+                    builder.endObject();
+
+                    builder.startObject(ConnectorIndexFields.LAST_SYNCED_FIELD.getPreferredName());
                     builder.field("type", "date");
                     builder.endObject();
 
-                    builder.startObject(Connector.NAME_FIELD.getPreferredName());
+                    builder.startObject(ConnectorIndexFields.NAME_FIELD.getPreferredName());
                     builder.field("type", "keyword");
                     builder.endObject();
 
-                    builder.startObject(Connector.SERVICE_TYPE_FIELD.getPreferredName());
+                    builder.startObject(ConnectorIndexFields.PIPELINE_FIELD.getPreferredName());
+                    builder.field("type", "object");
+                    builder.field("enabled", false);
+                    builder.endObject();
+
+                    builder.startObject(ConnectorIndexFields.SCHEDULING_FIELD.getPreferredName());
+                    builder.field("type", "object");
+                    builder.field("enabled", false);
+                    builder.endObject();
+
+                    builder.startObject(ConnectorIndexFields.SERVICE_TYPE_FIELD.getPreferredName());
                     builder.field("type", "keyword");
                     builder.endObject();
 
-                    builder.startObject(Connector.STATUS_FIELD.getPreferredName());
+                    builder.startObject(ConnectorIndexFields.STATUS_FIELD.getPreferredName());
                     builder.field("type", "keyword");
                     builder.endObject();
 
-                    builder.startObject(Connector.SYNC_NOW_FIELD.getPreferredName());
+                    builder.startObject(ConnectorIndexFields.SYNC_NOW_FIELD.getPreferredName());
                     builder.field("type", "boolean");
                     builder.endObject();
                 }
@@ -252,11 +321,8 @@ public class ConnectorIndexService implements ClusterStateListener {
 
     private static Settings getConnectorSyncJobsIndexSettings() {
         return Settings.builder()
-            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
-            .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
-            .put(IndexMetadata.SETTING_AUTO_EXPAND_REPLICAS, "0-3")
+            .put(IndexMetadata.SETTING_AUTO_EXPAND_REPLICAS, "0-1")
             .put(IndexMetadata.SETTING_INDEX_HIDDEN, true)
-            .put("index.refresh_interval", "1s")
             .build();
     }
 
@@ -266,49 +332,64 @@ public class ConnectorIndexService implements ClusterStateListener {
             builder.startObject();
             {
                 builder.startObject("_meta");
-                builder.field("version", Version.CURRENT.toString());
+                builder.field("version", "1");
                 builder.endObject();
 
                 builder.field("dynamic", "false");
                 builder.startObject("properties");
                 {
-                    builder.startObject(ConnectorSyncJob.CANCELATION_REQUESTED_AT_FIELD.getPreferredName());
+                    builder.startObject(ConnectorSyncJobIndexFields.CANCELATION_REQUESTED_AT_FIELD.getPreferredName());
                     builder.field("type", "date");
                     builder.endObject();
 
-                    builder.startObject(ConnectorSyncJob.CANCELED_AT_FIELD.getPreferredName());
+                    builder.startObject(ConnectorSyncJobIndexFields.CANCELED_AT_FIELD.getPreferredName());
                     builder.field("type", "date");
                     builder.endObject();
 
-                    builder.startObject(ConnectorSyncJob.COMPLETED_AT.getPreferredName());
+                    builder.startObject(ConnectorSyncJobIndexFields.COMPLETED_AT.getPreferredName());
                     builder.field("type", "date");
                     builder.endObject();
 
-                    builder.startObject(ConnectorSyncJob.CREATED_AT_FIELD.getPreferredName());
+                    builder.startObject(ConnectorSyncJobIndexFields.CREATED_AT_FIELD.getPreferredName());
                     builder.field("type", "date");
                     builder.endObject();
 
-                    builder.startObject(ConnectorSyncJob.CONNECTOR_FIELD.getPreferredName());
+                    builder.startObject(ConnectorSyncJobIndexFields.CONNECTOR_FIELD.getPreferredName());
                     {
                         builder.startObject("properties");
                         {
-                            builder.startObject(Connector.ID_FIELD.getPreferredName());
+                            builder.startObject(ConnectorIndexFields.CONFIGURATION_FIELD.getPreferredName());
+                            builder.field("type", "object");
+                            builder.field("enabled", "false");
+                            builder.endObject();
+
+                            builder.startObject(ConnectorIndexFields.ID_FIELD.getPreferredName());
                             builder.field("type", "keyword");
                             builder.endObject();
 
-                            builder.startObject(Connector.INDEX_NAME_FIELD.getPreferredName());
+                            builder.startObject(ConnectorIndexFields.FILTERING_FIELD.getPreferredName());
+                            builder.field("type", "object");
+                            builder.field("enabled", "false");
+                            builder.endObject();
+
+                            builder.startObject(ConnectorIndexFields.INDEX_NAME_FIELD.getPreferredName());
                             builder.field("type", "keyword");
                             builder.endObject();
 
-                            builder.startObject(Connector.IS_NATIVE_FIELD.getPreferredName());
+                            builder.startObject(ConnectorIndexFields.IS_NATIVE_FIELD.getPreferredName());
                             builder.field("type", "boolean");
                             builder.endObject();
 
-                            builder.startObject(Connector.LANGUAGE_FIELD.getPreferredName());
+                            builder.startObject(ConnectorIndexFields.LANGUAGE_FIELD.getPreferredName());
                             builder.field("type", "keyword");
                             builder.endObject();
 
-                            builder.startObject(Connector.SERVICE_TYPE_FIELD.getPreferredName());
+                            builder.startObject(ConnectorIndexFields.PIPELINE_FIELD.getPreferredName());
+                            builder.field("type", "object");
+                            builder.field("enabled", "false");
+                            builder.endObject();
+
+                            builder.startObject(ConnectorIndexFields.SERVICE_TYPE_FIELD.getPreferredName());
                             builder.field("type", "keyword");
                             builder.endObject();
                         }
@@ -316,43 +397,48 @@ public class ConnectorIndexService implements ClusterStateListener {
                     }
                     builder.endObject();
 
-                    builder.startObject(ConnectorSyncJob.DELETED_DOCUMENT_COUNT_FIELD.getPreferredName());
-                    builder.field("type", "number");
+                    builder.startObject(ConnectorSyncJobIndexFields.DELETED_DOCUMENT_COUNT_FIELD.getPreferredName());
+                    builder.field("type", "long");
                     builder.endObject();
 
-                    builder.startObject(ConnectorSyncJob.ERROR_FIELD.getPreferredName());
-                    builder.field("type", "boolean");
-                    builder.endObject();
-
-                    builder.startObject(ConnectorSyncJob.INDEXED_DOCUMENT_COUNT_FIELD.getPreferredName());
-                    builder.field("type", "number");
-                    builder.endObject();
-
-                    builder.startObject(ConnectorSyncJob.INDEXED_DOCUMENT_VOLUME_FIELD.getPreferredName());
-                    builder.field("type", "number");
-                    builder.endObject();
-
-                    builder.startObject(ConnectorSyncJob.LAST_SEEN_FIELD.getPreferredName());
-                    builder.field("type", "date");
-                    builder.endObject();
-
-                    builder.startObject(ConnectorSyncJob.STARTED_AT_FIELD.getPreferredName());
-                    builder.field("type", "date");
-                    builder.endObject();
-
-                    builder.startObject(ConnectorSyncJob.STATUS_FIELD.getPreferredName());
+                    builder.startObject(ConnectorSyncJobIndexFields.ERROR_FIELD.getPreferredName());
                     builder.field("type", "keyword");
                     builder.endObject();
 
-                    builder.startObject(ConnectorSyncJob.TOTAL_DOCUMENT_COUNT_FIELD.getPreferredName());
-                    builder.field("type", "number");
+                    builder.startObject(ConnectorSyncJobIndexFields.INDEXED_DOCUMENT_COUNT_FIELD.getPreferredName());
+                    builder.field("type", "long");
                     builder.endObject();
 
-                    builder.startObject(ConnectorSyncJob.TRIGGER_METHOD_FIELD.getPreferredName());
+                    builder.startObject(ConnectorSyncJobIndexFields.INDEXED_DOCUMENT_VOLUME_FIELD.getPreferredName());
+                    builder.field("type", "long");
+                    builder.endObject();
+
+                    builder.startObject(ConnectorSyncJobIndexFields.LAST_SEEN_FIELD.getPreferredName());
+                    builder.field("type", "date");
+                    builder.endObject();
+
+                    builder.startObject(ConnectorSyncJobIndexFields.METADATA_FIELD.getPreferredName());
+                    builder.field("type", "date");
+                    builder.field("enabled", false);
+                    builder.endObject();
+
+                    builder.startObject(ConnectorSyncJobIndexFields.STARTED_AT_FIELD.getPreferredName());
+                    builder.field("type", "date");
+                    builder.endObject();
+
+                    builder.startObject(ConnectorSyncJobIndexFields.STATUS_FIELD.getPreferredName());
                     builder.field("type", "keyword");
                     builder.endObject();
 
-                    builder.startObject(ConnectorSyncJob.WORKER_HOSTNAME_FIELD.getPreferredName());
+                    builder.startObject(ConnectorSyncJobIndexFields.TOTAL_DOCUMENT_COUNT_FIELD.getPreferredName());
+                    builder.field("type", "long");
+                    builder.endObject();
+
+                    builder.startObject(ConnectorSyncJobIndexFields.TRIGGER_METHOD_FIELD.getPreferredName());
+                    builder.field("type", "keyword");
+                    builder.endObject();
+
+                    builder.startObject(ConnectorSyncJobIndexFields.WORKER_HOSTNAME_FIELD.getPreferredName());
                     builder.field("type", "keyword");
                     builder.endObject();
                 }

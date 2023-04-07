@@ -10,10 +10,10 @@ package org.elasticsearch.xpack.application.connector;
 import org.elasticsearch.xcontent.ParseField;
 
 /**
- * The {@link ConnectorSyncJob} model.
+ * The {@link ConnectorSyncJobIndexFields} model.
  * Currently only holds the fields we use to construct the connectors sync jobs index
  */
-public class ConnectorSyncJob {
+public class ConnectorSyncJobIndexFields {
     public static final ParseField CANCELATION_REQUESTED_AT_FIELD = new ParseField("cancelation_requested_at");
     public static final ParseField CANCELED_AT_FIELD = new ParseField("canceled_at");
     public static final ParseField COMPLETED_AT = new ParseField("completed_at");
@@ -24,6 +24,7 @@ public class ConnectorSyncJob {
     public static final ParseField INDEXED_DOCUMENT_COUNT_FIELD = new ParseField("indexed_document_count");
     public static final ParseField INDEXED_DOCUMENT_VOLUME_FIELD = new ParseField("indexed_document_volume");
     public static final ParseField LAST_SEEN_FIELD = new ParseField("last_seen");
+    public static final ParseField METADATA_FIELD = new ParseField("metadata");
     public static final ParseField STARTED_AT_FIELD = new ParseField("started_at");
     public static final ParseField STATUS_FIELD = new ParseField("status");
     public static final ParseField TOTAL_DOCUMENT_COUNT_FIELD = new ParseField("total_document_count");
